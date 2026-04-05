@@ -4,11 +4,16 @@
 // to produce (Arithmetic Intensity, TFLOPS) data points for roofline charts.
 //
 // Build:  make                        (needs hipBLASLt)
-// Run:    ./build/gemm_roofline
+// Run:    ./build/gemm_roofline                          # default shapes
+//         ./build/gemm_roofline 4096,4096,4096           # custom shape
+//         ./build/gemm_roofline 4096,4096,4096 1,4096,11008
 
 #include "bench_common.h"
 #include <hipblaslt/hipblaslt.h>
 #include <vector>
+#include <string>
+#include <cstring>
+#include <algorithm>
 
 #define BLASLT_CHECK(cmd) do { \
     hipblasStatus_t s = cmd; \
@@ -24,30 +29,48 @@
 
 struct GemmShape {
     int M, N, K;
-    const char* tag;
+    std::string tag;
 };
 
-static GemmShape shapes[] = {
-    // Square — increasing arithmetic intensity
-    {128,   128,   128,   "sq-128"},
-    {256,   256,   256,   "sq-256"},
-    {512,   512,   512,   "sq-512"},
-    {1024,  1024,  1024,  "sq-1k"},
-    {2048,  2048,  2048,  "sq-2k"},
-    {4096,  4096,  4096,  "sq-4k"},
-    {8192,  8192,  8192,  "sq-8k"},
-    {16384, 16384, 16384, "sq-16k"},
-    // LLM inference — typical transformer GEMM shapes
-    {1,     4096,  4096,  "tok-1"},
-    {32,    4096,  4096,  "tok-32"},
-    {128,   4096,  4096,  "tok-128"},
-    {512,   4096,  4096,  "pf-512"},
-    {2048,  4096,  4096,  "pf-2k"},
-    {4096,  11008, 4096,  "ffn-up"},
-    {4096,  4096,  11008, "ffn-dn"},
-};
+static std::vector<GemmShape> default_shapes() {
+    return {
+        {128,   128,   128,   "sq-128"},
+        {256,   256,   256,   "sq-256"},
+        {512,   512,   512,   "sq-512"},
+        {1024,  1024,  1024,  "sq-1k"},
+        {2048,  2048,  2048,  "sq-2k"},
+        {4096,  4096,  4096,  "sq-4k"},
+        {8192,  8192,  8192,  "sq-8k"},
+        {16384, 16384, 16384, "sq-16k"},
+        {1,     4096,  4096,  "tok-1"},
+        {32,    4096,  4096,  "tok-32"},
+        {128,   4096,  4096,  "tok-128"},
+        {512,   4096,  4096,  "pf-512"},
+        {2048,  4096,  4096,  "pf-2k"},
+        {4096,  11008, 4096,  "ffn-up"},
+        {4096,  4096,  11008, "ffn-dn"},
+    };
+}
 
-static constexpr int NUM_SHAPES = sizeof(shapes) / sizeof(shapes[0]);
+static bool parse_shape(const char* arg, GemmShape& out) {
+    int m, n, k;
+    if (sscanf(arg, "%d,%d,%d", &m, &n, &k) != 3) return false;
+    if (m < 1 || n < 1 || k < 1) return false;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%dx%dx%d", m, n, k);
+    out = {m, n, k, buf};
+    return true;
+}
+
+static void usage(const char* prog) {
+    printf("Usage: %s [M,N,K ...]\n\n", prog);
+    printf("  No arguments  — run built-in shapes (square + LLM inference)\n");
+    printf("  M,N,K          — benchmark one or more custom shapes\n\n");
+    printf("Examples:\n");
+    printf("  %s                                  # default 15 shapes\n", prog);
+    printf("  %s 4096,4096,4096                   # single custom shape\n", prog);
+    printf("  %s 4096,4096,4096 1,4096,11008      # multiple custom shapes\n", prog);
+}
 
 // =========================================================================
 //  Data type definitions
@@ -78,16 +101,35 @@ static constexpr int NUM_DTYPES = sizeof(dtypes) / sizeof(dtypes[0]);
 // =========================================================================
 
 int main(int argc, char** argv) {
+    // Parse shapes from command line or use defaults
+    std::vector<GemmShape> shapes;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]); return 0;
+        }
+        GemmShape sh;
+        if (!parse_shape(argv[i], sh)) {
+            fprintf(stderr, "Bad shape '%s' — expected M,N,K (e.g. 4096,4096,4096)\n", argv[i]);
+            return 1;
+        }
+        shapes.push_back(sh);
+    }
+    if (shapes.empty()) shapes = default_shapes();
+
     GpuInfo gpu = get_gpu_info();
 
     printf("=== GEMM Roofline Benchmark (hipBLASLt) ===\n");
     print_gpu_info(gpu);
-    printf("\n");
+    printf("Shapes:   %zu\n\n", shapes.size());
 
-    // Pre-allocate device buffers for largest shape
-    const size_t MAX_DIM   = 16384;
-    const size_t MAX_ELEMS = MAX_DIM * MAX_DIM;
-    const size_t MAX_BYTES = MAX_ELEMS * 4;         // FP32 worst case
+    // Pre-allocate device buffers based on largest shape
+    size_t max_bytes = 0;
+    for (auto& sh : shapes) {
+        max_bytes = std::max(max_bytes, (size_t)sh.M * sh.K * 4);
+        max_bytes = std::max(max_bytes, (size_t)sh.K * sh.N * 4);
+        max_bytes = std::max(max_bytes, (size_t)sh.M * sh.N * 4);
+    }
+    const size_t MAX_BYTES = max_bytes;
     const size_t WS_BYTES  = 256ULL * 1024 * 1024;  // 256 MB workspace
 
     void *d_A, *d_B, *d_C, *d_ws;
@@ -118,14 +160,14 @@ int main(int argc, char** argv) {
                "Tag", "M", "N", "K", "TFLOPS", "AI", "Eff%", "Time");
         printf("--------------------------------------------------------------\n");
 
-        for (int si = 0; si < NUM_SHAPES; si++) {
+        for (int si = 0; si < (int)shapes.size(); si++) {
             auto& sh = shapes[si];
 
             size_t a_bytes = (size_t)sh.M * sh.K * dt.in_bytes;
             size_t b_bytes = (size_t)sh.K * sh.N * dt.in_bytes;
             size_t c_bytes = (size_t)sh.M * sh.N * dt.out_bytes;
             if (a_bytes > MAX_BYTES || b_bytes > MAX_BYTES || c_bytes > MAX_BYTES) {
-                printf("%-10s %6d %6d %6d  %8s\n", sh.tag, sh.M, sh.N, sh.K, "OOM");
+                printf("%-10s %6d %6d %6d  %8s\n", sh.tag.c_str(), sh.M, sh.N, sh.K, "OOM");
                 continue;
             }
 
@@ -158,7 +200,7 @@ int main(int argc, char** argv) {
                 handle, matmul, la, lb, lc, lc, pref, MAX_ALGOS, hresults, &found);
 
             if (hstat != HIPBLAS_STATUS_SUCCESS || found == 0) {
-                printf("%-10s %6d %6d %6d  %8s\n", sh.tag, sh.M, sh.N, sh.K, "no algo");
+                printf("%-10s %6d %6d %6d  %8s\n", sh.tag.c_str(), sh.M, sh.N, sh.K, "no algo");
                 BLASLT_CHECK(hipblasLtMatmulPreferenceDestroy(pref));
                 BLASLT_CHECK(hipblasLtMatrixLayoutDestroy(la));
                 BLASLT_CHECK(hipblasLtMatrixLayoutDestroy(lb));
@@ -224,7 +266,7 @@ int main(int argc, char** argv) {
             double avg_ms = flops / (s.avg * 1e9);
 
             printf("%-10s %6d %6d %6d  %8.1f %7.1f %5.1f%% %8.3fms\n",
-                   sh.tag, sh.M, sh.N, sh.K, s.avg, ai_val, eff, avg_ms);
+                   sh.tag.c_str(), sh.M, sh.N, sh.K, s.avg, ai_val, eff, avg_ms);
 
             BLASLT_CHECK(hipblasLtMatmulPreferenceDestroy(pref));
             BLASLT_CHECK(hipblasLtMatrixLayoutDestroy(la));
